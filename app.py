@@ -11,6 +11,9 @@ socketio = SocketIO(app, cors_allowed_origins="*")
 
 rooms = {}
 
+# Tamaño del mapa (40x40 bloques)
+GRID_SIZE = 40
+
 def generate_room_code():
     return ''.join(random.choices(string.ascii_uppercase + string.digits, k=5))
 
@@ -24,10 +27,11 @@ def on_create_room(data):
         'players': {},
         'host': request.sid,
         'state': 'lobby',
-        # Ahora hay múltiples comidas y más obstáculos
-        'foods': [{'x': random.randint(0, 39), 'y': random.randint(0, 39)} for _ in range(5)],
-        'obstacles': [{'x': random.randint(2, 37), 'y': random.randint(2, 37)} for _ in range(15)],
-        'rankings': [] # Aquí guardaremos a los que vayan perdiendo
+        # Mantenemos 5 comidas a la vez
+        'foods': [{'x': random.randint(0, GRID_SIZE-1), 'y': random.randint(0, GRID_SIZE-1)} for _ in range(5)],
+        # Generamos 15 obstáculos metálicos fijos
+        'obstacles': [{'x': random.randint(2, GRID_SIZE-3), 'y': random.randint(2, GRID_SIZE-3)} for _ in range(15)],
+        'rankings': []
     }
     
     # Serpiente inicial con tamaño 4
@@ -50,10 +54,12 @@ def on_join_room(data):
     
     if room in rooms and rooms[room]['state'] == 'lobby':
         join_room(room)
-        start_y = random.randint(5, 30)
+        # Posición inicial aleatoria para invitados
+        start_y = random.randint(5, GRID_SIZE-10)
+        start_x = random.randint(5, GRID_SIZE-10)
         rooms[room]['players'][request.sid] = {
             'nick': nick,
-            'body': [{'x': 10, 'y': start_y}, {'x': 9, 'y': start_y}, {'x': 8, 'y': start_y}, {'x': 7, 'y': start_y}],
+            'body': [{'x': start_x, 'y': start_y}, {'x': start_x-1, 'y': start_y}, {'x': start_x-2, 'y': start_y}, {'x': start_x-3, 'y': start_y}],
             'dir': 'right',
             'is_alive': True,
             'color': f'#{random.randint(0, 0xFFFFFF):06x}',
@@ -83,7 +89,6 @@ def on_change_dir(data):
             rooms[room]['players'][request.sid]['dir'] = new_dir
 
 def get_lobby_info(room):
-    # Devolvemos la lista de nombres para mostrar en el lobby
     return {
         'players': [p['nick'] for p in rooms[room]['players'].values()],
         'host': rooms[room]['host']
@@ -109,24 +114,29 @@ def game_loop(room):
             if player['dir'] == 'left': head['x'] -= 1
             if player['dir'] == 'right': head['x'] += 1
             
+            # --- NUEVA LÓGICA: ATRAVESAR PAREDES ---
+            # Si sale de la cuadrícula (0-39), vuelve a entrar por el lado opuesto
+            head['x'] = head['x'] % GRID_SIZE
+            head['y'] = head['y'] % GRID_SIZE
+            
             died = False
             
-            # 1. Colisión con la pared
-            if head['x'] < 0 or head['x'] >= 40 or head['y'] < 0 or head['y'] >= 40:
-                died = True
+            # Ya no hay colisión con paredes.
                 
-            # 2. Colisión con obstáculos
-            if not died:
-                for obs in game_state['obstacles']:
-                    if obs['x'] == head['x'] and obs['y'] == head['y']:
-                        died = True
-                        break
+            # 1. Colisión con obstáculos METÁLICOS
+            for obs in game_state['obstacles']:
+                if obs['x'] == head['x'] and obs['y'] == head['y']:
+                    died = True
+                    break
 
-            # 3. Colisión con otros o consigo mismo
+            # 2. Colisión con el cuerpo de otros o de sí mismo
             if not died:
                 for other_sid, other_player in game_state['players'].items():
                     if not other_player['is_alive']: continue
-                    for part in other_player['body']:
+                    # Comprobamos cada parte del cuerpo
+                    for index, part in enumerate(other_player['body']):
+                        # Si es la cabeza de otra serpiente y chocan cabezas, ambos mueren. 
+                        # Si choca con el cuerpo (index > 0), muere el que choca.
                         if head['x'] == part['x'] and head['y'] == part['y']:
                             died = True
                             break
@@ -136,21 +146,24 @@ def game_loop(room):
                 game_state['rankings'].append({'nick': player['nick'], 'score': player['score']})
                 continue
 
+            # Mover la serpiente insertando nueva cabeza
             player['body'].insert(0, head)
 
-            # Comer (Iteramos sobre la lista de comidas)
+            # Comer (Iteramos sobre las 5 comidas)
             ate = False
             for i, food in enumerate(game_state['foods']):
                 if head['x'] == food['x'] and head['y'] == food['y']:
                     player['score'] += 10 # Sumamos puntos
-                    game_state['foods'][i] = {'x': random.randint(0, 39), 'y': random.randint(0, 39)}
+                    # Reaparecer comida en lugar aleatorio
+                    game_state['foods'][i] = {'x': random.randint(0, GRID_SIZE-1), 'y': random.randint(0, GRID_SIZE-1)}
                     ate = True
                     break
             
             if not ate:
+                # Si no comió, removemos la cola para mantener el tamaño actual
                 player['body'].pop()
 
-        # --- LÓGICA DE FIN DE JUEGO ---
+        # --- LÓGICA DE FIN DE JUEGO (Tabla de posiciones) ---
         total_players = len(game_state['players'])
         # Termina si hay más de 1 jugador y queda 1 o 0 vivos
         if total_players > 1 and alive_count <= 1:
@@ -170,8 +183,11 @@ def game_loop(room):
             socketio.emit('game_over', {'rankings': game_state['rankings']}, to=room)
             break
 
+        # Enviar estado actualizado del juego a todos en la sala
         socketio.emit('game_state', game_state, to=room)
+        # Velocidad del juego (10 FPS)
         socketio.sleep(0.1)
 
 if __name__ == '__main__':
-    socketio.run(app, host='0.0.0.0', port=5000)
+    # Usar gunicorn para producción, pero localmente Flask-SocketIO está bien
+    socketio.run(app, host='0.0.0.0', port=5000, debug=True)
